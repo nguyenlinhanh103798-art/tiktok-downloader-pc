@@ -2,10 +2,12 @@
 import sys
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
+import imageio_ffmpeg
 
 from PySide6.QtCore import QThread, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
@@ -16,18 +18,24 @@ from PySide6.QtWidgets import (
 )
 
 
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi"
+}
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".m4a", ".aac", ".wav", ".opus", ".ogg"
+}
+
+
 def normalize_input(value):
     value = value.strip()
 
-    # Nhập trực tiếp @username
     if re.fullmatch(r"@[\w.-]+", value):
         return "https://www.tiktok.com/" + value, True
 
-    # Nhập username không có dấu @
     if re.fullmatch(r"[\w.-]+", value):
         return "https://www.tiktok.com/@" + value, True
 
-    # Kiểm tra URL TikTok
     if value.startswith(("https://", "http://")):
         parsed = urlparse(value)
         host = (parsed.hostname or "").lower()
@@ -68,6 +76,16 @@ class DownloadWorker(QThread):
     def run(self):
         os.makedirs(self.folder, exist_ok=True)
 
+        try:
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as error:
+            self.finished_item.emit(
+                "LỖI FFmpeg: Không tìm thấy chương trình ghép video.\n"
+                + str(error)
+            )
+            self.completed.emit()
+            return
+
         for index, item in enumerate(self.items, start=1):
             url, is_profile = item
 
@@ -78,9 +96,12 @@ class DownloadWorker(QThread):
                 f"Đang xử lý {label} {index}/{len(self.items)}..."
             )
 
+            start_time = time.time()
             downloaded_paths = []
 
             def progress_hook(data):
+                info = data.get("info_dict") or {}
+
                 if data.get("status") == "downloading":
                     total = (
                         data.get("total_bytes")
@@ -94,7 +115,10 @@ class DownloadWorker(QThread):
                         self.progress.emit(min(percent, 100))
 
                 elif data.get("status") == "finished":
-                    filename = data.get("filename")
+                    filename = (
+                        info.get("filepath")
+                        or data.get("filename")
+                    )
 
                     if filename:
                         downloaded_paths.append(filename)
@@ -109,19 +133,21 @@ class DownloadWorker(QThread):
                     downloaded_paths.append(filename)
 
             options = {
-                # Ưu tiên MP4 có cả hình và tiếng.
-                # Không sử dụng chế độ tải audio riêng.
-                "format": "best[ext=mp4]/best",
+                # Ưu tiên video MP4 + âm thanh M4A.
+                # Nếu không có thì thử các luồng video khác.
+                # Tuyệt đối không chọn định dạng chỉ có âm thanh.
+                "format": (
+                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                    "bestvideo+bestaudio/"
+                    "best[ext=mp4]/best"
+                ),
 
                 "outtmpl": os.path.join(
                     self.folder,
                     "%(uploader)s_%(title).80B_%(id)s.%(ext)s"
                 ),
 
-                # Tài khoản là playlist, video đơn không phải playlist.
                 "noplaylist": not is_profile,
-
-                # Tiếp tục các video khác nếu một video bị lỗi.
                 "ignoreerrors": True,
 
                 "quiet": True,
@@ -130,10 +156,14 @@ class DownloadWorker(QThread):
 
                 "retries": 5,
                 "fragment_retries": 5,
-                "extractor_retries": 3,
-                "socket_timeout": 30,
+                "extractor_retries": 5,
+                "socket_timeout": 45,
 
+                # Ghép hình và tiếng thành MP4.
                 "merge_output_format": "mp4",
+
+                # Dùng FFmpeg được đóng gói cùng phần mềm.
+                "ffmpeg_location": ffmpeg_path,
 
                 "progress_hooks": [progress_hook],
                 "postprocessor_hooks": [postprocessor_hook],
@@ -155,44 +185,56 @@ class DownloadWorker(QThread):
                         download=True
                     )
 
-                # Lọc những file thực sự đã được tải.
+                # Lấy các file được tạo hoặc cập nhật trong lần tải này.
+                candidates = list(downloaded_paths)
+
+                for path in Path(self.folder).iterdir():
+                    if path.is_file():
+                        try:
+                            if path.stat().st_mtime >= start_time - 2:
+                                candidates.append(str(path))
+                        except OSError:
+                            pass
+
                 saved_files = []
 
-                for path in downloaded_paths:
-                    if not path:
+                for filename in candidates:
+                    if not filename:
                         continue
 
-                    path = os.path.abspath(path)
+                    path = os.path.abspath(filename)
 
-                    if (
-                        os.path.isfile(path)
-                        and Path(path).suffix.lower()
-                        not in (".mp3", ".m4a", ".aac", ".wav")
-                        and path not in saved_files
-                    ):
+                    if not os.path.isfile(path):
+                        continue
+
+                    extension = Path(path).suffix.lower()
+
+                    # Không nhận file âm thanh là video.
+                    if extension in AUDIO_EXTENSIONS:
+                        continue
+
+                    if extension not in VIDEO_EXTENSIONS:
+                        continue
+
+                    if path not in saved_files:
                         saved_files.append(path)
 
                 if not saved_files:
-                    if info is None:
-                        raise Exception(
-                            "TikTok không trả về dữ liệu video."
-                        )
-
                     raise Exception(
-                        "Không tìm thấy file video đã tải. "
-                        "Có thể TikTok chặn truy cập hoặc "
-                        "không cung cấp định dạng phù hợp."
+                        "Không tìm thấy file video có hình ảnh.\n"
+                        "TikTok có thể không cung cấp luồng hình ảnh "
+                        "hoặc đã hạn chế truy cập video này."
                     )
 
                 if is_profile:
                     self.finished_item.emit(
                         f"HOÀN TẤT TÀI KHOẢN: {url}\n"
-                        f"Đã tải được {len(saved_files)} video.\n"
+                        f"Tìm thấy {len(saved_files)} file video.\n"
                         + "\n".join(saved_files)
                     )
                 else:
                     self.finished_item.emit(
-                        f"THÀNH CÔNG: {saved_files[0]}"
+                        f"THÀNH CÔNG: {saved_files[-1]}"
                     )
 
             except Exception as error:
