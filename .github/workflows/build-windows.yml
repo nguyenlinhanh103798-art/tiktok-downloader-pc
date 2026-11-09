@@ -1,0 +1,36 @@
+
+name: Build TikTok Downloader EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Lay ma nguon
+        uses: actions/checkout@v4
+
+      - name: Cai dat Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cai dat thu vien
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Dong goi EXE
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name TikTokDownloader main.py
+
+      - name: Luu file EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: TikTokDownloader-Windows
+          path: dist/TikTokDownloader.exe
