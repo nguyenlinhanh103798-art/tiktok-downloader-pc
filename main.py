@@ -1,333 +1,539 @@
 
 import sys
-import os
 from pathlib import Path
 
-import yt_dlp
-
-from PySide6.QtCore import QThread, Signal, QUrl
+from PySide6.QtCore import QThread, Signal, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QTextEdit, QPushButton,
-    QLineEdit, QFileDialog, QProgressBar, QMessageBox
+    QLineEdit, QFileDialog, QMessageBox, QTableWidget,
+    QTableWidgetItem, QHeaderView, QSpinBox
 )
 
+from task_manager import TaskManager
+from account_manager import TikTokAccountManager
+from excel_export import ExcelExporter
+from security import AppSecurity
 
-class DownloadWorker(QThread):
-    progress = Signal(int)
-    status = Signal(str)
-    finished_item = Signal(str)
-    completed = Signal()
 
-    def __init__(self, urls, folder):
+class AccountWorker(QThread):
+    finished_links = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, username, limit):
         super().__init__()
-        self.urls = urls
-        self.folder = folder
+        self.username = username
+        self.limit = limit
 
     def run(self):
-        os.makedirs(self.folder, exist_ok=True)
-
-        for index, url in enumerate(self.urls, start=1):
-            self.progress.emit(0)
-            self.status.emit(
-                f"Đang tải video {index}/{len(self.urls)}..."
+        try:
+            manager = TikTokAccountManager()
+            videos = manager.get_video_urls(
+                self.username,
+                self.limit
             )
-
-            downloaded_paths = []
-
-            def progress_hook(data):
-                if data.get("filename"):
-                    downloaded_paths.append(data["filename"])
-
-                if data.get("status") == "downloading":
-                    total = (
-                        data.get("total_bytes")
-                        or data.get("total_bytes_estimate")
-                        or 0
-                    )
-                    current = data.get("downloaded_bytes", 0)
-
-                    if total:
-                        percent = int(current * 100 / total)
-                        self.progress.emit(min(percent, 100))
-
-                elif data.get("status") == "finished":
-                    self.progress.emit(100)
-
-            options = {
-                "format": "best",
-                "outtmpl": os.path.join(
-                    self.folder,
-                    "%(title).100B_%(id)s.%(ext)s"
-                ),
-                "noplaylist": True,
-                "ignoreerrors": False,
-                "quiet": True,
-                "no_warnings": False,
-                "windowsfilenames": True,
-                "retries": 5,
-                "fragment_retries": 5,
-                "socket_timeout": 30,
-                "merge_output_format": "mp4",
-                "progress_hooks": [progress_hook],
-                "http_headers": {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 Chrome/130.0.0.0 "
-                        "Safari/537.36"
-                    ),
-                    "Referer": "https://www.tiktok.com/",
-                },
-            }
-
-            try:
-                with yt_dlp.YoutubeDL(options) as downloader:
-                    info = downloader.extract_info(
-                        url,
-                        download=True
-                    )
-
-                if not info:
-                    raise Exception(
-                        "Không lấy được thông tin video."
-                    )
-
-                # Lấy đường dẫn video từ kết quả tải
-                paths = list(downloaded_paths)
-
-                def collect_paths(data):
-                    if not isinstance(data, dict):
-                        return
-
-                    for key in ("filepath", "_filename"):
-                        value = data.get(key)
-                        if value:
-                            paths.append(value)
-
-                    for item in data.get("requested_downloads") or []:
-                        if isinstance(item, dict):
-                            if item.get("filepath"):
-                                paths.append(item["filepath"])
-
-                    for entry in data.get("entries") or []:
-                        collect_paths(entry)
-
-                collect_paths(info)
-
-                # Chỉ báo thành công khi file thực sự tồn tại
-                saved_files = []
-                for path in paths:
-                    if path and os.path.isfile(path):
-                        if path not in saved_files:
-                            saved_files.append(path)
-
-                if not saved_files:
-                    raise Exception(
-                        "Không tìm thấy file video đã lưu. "
-                        "Có thể link không tải được hoặc video đã bị hạn chế."
-                    )
-
-                self.progress.emit(100)
-                self.finished_item.emit(
-                    f"THÀNH CÔNG: {saved_files[0]}"
-                )
-
-            except Exception as error:
-                self.finished_item.emit(
-                    f"THẤT BẠI: {url}\nLý do: {error}"
-                )
-
-        self.status.emit("Đã xử lý xong danh sách link.")
-        self.completed.emit()
+            self.finished_links.emit(videos)
+        except Exception as error:
+            self.failed.emit(str(error))
 
 
-class TikTokDownloader(QMainWindow):
+class MainWindow(QMainWindow):
+
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("TikTok Downloader - Tải video hàng loạt")
-        self.resize(750, 600)
+        self.setWindowTitle("TikTok Downloader Pro")
+        self.resize(1150, 780)
 
-        default_folder = os.path.join(
-            str(Path.home()), "Downloads", "TikTokVideos"
+        self.security = AppSecurity()
+        self.settings = self.security.load_settings()
+
+        self.download_folder = self.settings["output_dir"]
+
+        self.manager = TaskManager(
+            output_dir=self.download_folder,
+            max_workers=5
         )
 
-        self.worker = None
-        self.download_folder = default_folder
+        self.account_worker = None
+        self.exporter = ExcelExporter()
+
+        self.build_interface()
+        self.refresh_table()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_table)
+        self.timer.start(1500)
+
+    def build_interface(self):
 
         central = QWidget()
         self.setCentralWidget(central)
 
         layout = QVBoxLayout(central)
 
-        title = QLabel("TIKTOK VIDEO DOWNLOADER")
+        title = QLabel("TIKTOK DOWNLOADER PRO")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
-            "font-size: 23px; font-weight: bold; color: #e53935;"
+            "font-size:26px;font-weight:bold;color:#e53935;"
+            "padding:12px;"
         )
         layout.addWidget(title)
 
-        guide = QLabel(
-            "Dán link video TikTok vào ô bên dưới. "
-            "Mỗi link một dòng."
+        subtitle = QLabel(
+            "Tải video hàng loạt | Quản lý tài khoản | "
+            "Lịch sử | Xuất Excel"
         )
-        layout.addWidget(guide)
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+
+        layout.addWidget(QLabel("DANH SÁCH LINK VIDEO"))
 
         self.url_box = QTextEdit()
         self.url_box.setPlaceholderText(
-            "Ví dụ:\n"
-            "https://www.tiktok.com/@user/video/123456789\n"
-            "https://www.tiktok.com/@user/video/987654321"
+            "Dán nhiều link TikTok vào đây.\n"
+            "Mỗi link một dòng."
         )
+        self.url_box.setMinimumHeight(110)
         layout.addWidget(self.url_box)
 
-        file_row = QHBoxLayout()
+        row = QHBoxLayout()
 
-        self.folder_input = QLineEdit(default_folder)
+        self.add_button = QPushButton("THÊM LINK VÀO HÀNG ĐỢI")
+        self.add_button.clicked.connect(self.add_links)
+
+        self.txt_button = QPushButton("NHẬP FILE TXT")
+        self.txt_button.clicked.connect(self.load_txt)
+
+        row.addWidget(self.add_button)
+        row.addWidget(self.txt_button)
+        layout.addLayout(row)
+
+        layout.addWidget(QLabel("LẤY VIDEO TỪ TÀI KHOẢN TIKTOK"))
+
+        account_row = QHBoxLayout()
+
+        self.account_input = QLineEdit()
+        self.account_input.setPlaceholderText(
+            "Nhập @username hoặc link trang cá nhân"
+        )
+
+        self.limit_input = QSpinBox()
+        self.limit_input.setRange(1, 10000)
+        self.limit_input.setValue(100)
+        self.limit_input.setPrefix("Số video: ")
+
+        self.account_button = QPushButton("LẤY DANH SÁCH VIDEO")
+        self.account_button.clicked.connect(
+            self.fetch_account
+        )
+
+        account_row.addWidget(self.account_input)
+        account_row.addWidget(self.limit_input)
+        account_row.addWidget(self.account_button)
+
+        layout.addLayout(account_row)
+
+        layout.addWidget(QLabel("THƯ MỤC LƯU VIDEO"))
+
+        folder_row = QHBoxLayout()
+
+        self.folder_input = QLineEdit(self.download_folder)
         self.folder_input.setReadOnly(True)
 
-        browse_button = QPushButton("Chọn thư mục")
-        browse_button.clicked.connect(self.choose_folder)
+        choose_button = QPushButton("CHỌN THƯ MỤC")
+        choose_button.clicked.connect(self.choose_folder)
 
-        open_button = QPushButton("Mở thư mục")
+        open_button = QPushButton("MỞ THƯ MỤC")
         open_button.clicked.connect(self.open_folder)
 
-        file_row.addWidget(self.folder_input)
-        file_row.addWidget(browse_button)
-        file_row.addWidget(open_button)
+        folder_row.addWidget(self.folder_input)
+        folder_row.addWidget(choose_button)
+        folder_row.addWidget(open_button)
 
-        layout.addLayout(file_row)
+        layout.addLayout(folder_row)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+        layout.addWidget(QLabel("QUẢN LÝ TÁC VỤ"))
 
-        self.status_label = QLabel("Sẵn sàng tải video.")
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels([
+            "ID",
+            "Link TikTok",
+            "Trạng thái",
+            "Tiến độ",
+            "Đường dẫn file"
+        ])
+
+        self.table.setColumnHidden(0, True)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Stretch
+        )
+
+        layout.addWidget(self.table)
+
+        control_row = QHBoxLayout()
+
+        pause_button = QPushButton("TẠM DỪNG")
+        pause_button.clicked.connect(self.pause_selected)
+
+        resume_button = QPushButton("TIẾP TỤC")
+        resume_button.clicked.connect(self.resume_selected)
+
+        cancel_button = QPushButton("HỦY TẢI")
+        cancel_button.clicked.connect(self.cancel_selected)
+
+        export_button = QPushButton("XUẤT EXCEL")
+        export_button.clicked.connect(self.export_excel)
+
+        control_row.addWidget(pause_button)
+        control_row.addWidget(resume_button)
+        control_row.addWidget(cancel_button)
+        control_row.addWidget(export_button)
+
+        layout.addLayout(control_row)
+
+        self.status_label = QLabel("Sẵn sàng.")
+        self.status_label.setStyleSheet(
+            "padding:8px;font-weight:bold;"
+        )
         layout.addWidget(self.status_label)
 
-        button_row = QHBoxLayout()
+    def add_links(self):
 
-        self.load_button = QPushButton("Thêm link từ file TXT")
-        self.load_button.clicked.connect(self.load_txt)
-
-        self.download_button = QPushButton("TẢI VIDEO")
-        self.download_button.setStyleSheet(
-            "background-color: #e53935; color: white; "
-            "font-size: 16px; font-weight: bold; padding: 10px;"
-        )
-        self.download_button.clicked.connect(self.start_download)
-
-        button_row.addWidget(self.load_button)
-        button_row.addWidget(self.download_button)
-
-        layout.addLayout(button_row)
-
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setPlaceholderText(
-            "Kết quả tải video sẽ hiển thị ở đây..."
-        )
-        layout.addWidget(self.log_box)
-
-    def choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Chọn thư mục lưu video",
-            self.download_folder
-        )
-
-        if folder:
-            self.download_folder = folder
-            self.folder_input.setText(folder)
-
-    def open_folder(self):
-        os.makedirs(self.download_folder, exist_ok=True)
-        QDesktopServices.openUrl(
-            QUrl.fromLocalFile(self.download_folder)
-        )
-
-    def load_txt(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Chọn file chứa danh sách link",
-            "",
-            "Text files (*.txt)"
-        )
-
-        if not file_path:
-            return
-
-        try:
-            with open(file_path, "r", encoding="utf-8-sig") as file:
-                content = file.read()
-
-            self.url_box.setPlainText(content)
-            self.status_label.setText("Đã thêm danh sách link.")
-        except Exception as error:
-            QMessageBox.critical(
-                self, "Lỗi đọc file", str(error)
-            )
-
-    def start_download(self):
         text = self.url_box.toPlainText().strip()
+
+        if not text:
+            QMessageBox.warning(
+                self, "Thông báo", "Bạn chưa nhập link."
+            )
+            return
 
         urls = [
             line.strip()
             for line in text.splitlines()
-            if line.strip().startswith("http://")
-            or line.strip().startswith("https://")
+            if line.strip()
         ]
 
-        if not urls:
+        valid_urls = [
+            url for url in urls
+            if self.security.validate_tiktok_url(url)
+        ]
+
+        if not valid_urls:
             QMessageBox.warning(
                 self,
-                "Thiếu link",
-                "Bạn hãy nhập ít nhất một link video TikTok."
+                "Link không hợp lệ",
+                "Không tìm thấy link TikTok hợp lệ."
             )
             return
 
-        if self.worker and self.worker.isRunning():
+        results = self.manager.add_urls(
+            "\n".join(valid_urls)
+        )
+
+        self.refresh_table()
+
+        self.status_label.setText(
+            f"Đã thêm: {results['added']} | "
+            f"Trùng: {results['duplicates']} | "
+            f"Lỗi: {results['errors']}"
+        )
+
+    def load_txt(self):
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file TXT",
+            "",
+            "Text files (*.txt)"
+        )
+
+        if not path:
             return
 
-        os.makedirs(self.download_folder, exist_ok=True)
+        try:
+            with open(
+                path, "r", encoding="utf-8-sig"
+            ) as file:
+                self.url_box.setPlainText(file.read())
 
-        self.log_box.clear()
-        self.progress_bar.setValue(0)
-        self.download_button.setEnabled(False)
-        self.load_button.setEnabled(False)
+            self.status_label.setText(
+                "Đã nhập danh sách từ file TXT."
+            )
 
-        self.worker = DownloadWorker(
-            urls,
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Lỗi", str(error)
+            )
+
+    def fetch_account(self):
+
+        username = self.account_input.text().strip()
+
+        if not username:
+            QMessageBox.warning(
+                self, "Thông báo",
+                "Hãy nhập tên tài khoản TikTok."
+            )
+            return
+
+        if (
+            self.account_worker
+            and self.account_worker.isRunning()
+        ):
+            return
+
+        self.account_button.setEnabled(False)
+        self.status_label.setText(
+            "Đang lấy danh sách video tài khoản..."
+        )
+
+        self.account_worker = AccountWorker(
+            username,
+            self.limit_input.value()
+        )
+
+        self.account_worker.finished_links.connect(
+            self.account_finished
+        )
+        self.account_worker.failed.connect(
+            self.account_failed
+        )
+        self.account_worker.finished.connect(
+            lambda: self.account_button.setEnabled(True)
+        )
+
+        self.account_worker.start()
+
+    def account_finished(self, links):
+
+        self.url_box.setPlainText(
+            "\n".join(links)
+        )
+
+        self.status_label.setText(
+            f"Đã tìm thấy {len(links)} video. "
+            "Kiểm tra danh sách rồi bấm thêm link."
+        )
+
+    def account_failed(self, message):
+
+        self.status_label.setText(
+            "Không lấy được danh sách tài khoản."
+        )
+
+        QMessageBox.warning(
+            self,
+            "Lỗi lấy video",
+            message
+        )
+
+    def choose_folder(self):
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Chọn thư mục lưu video",
             self.download_folder
         )
 
-        self.worker.progress.connect(
-            self.progress_bar.setValue
-        )
-        self.worker.status.connect(
-            self.status_label.setText
-        )
-        self.worker.finished_item.connect(
-            self.show_result
-        )
-        self.worker.completed.connect(
-            self.download_finished
+        if not folder:
+            return
+
+        self.download_folder = folder
+        self.folder_input.setText(folder)
+
+        self.settings["output_dir"] = folder
+        self.security.save_settings(self.settings)
+
+        QMessageBox.information(
+            self,
+            "Thông báo",
+            "Đã lưu thư mục cho lần chạy sau.\n"
+            "Thư mục mới sẽ áp dụng cho bộ tải sau khi "
+            "khởi động lại chương trình."
         )
 
-        self.worker.start()
+    def open_folder(self):
 
-    def show_result(self, message):
-        self.log_box.append(message)
+        folder = Path(self.download_folder)
+        folder.mkdir(parents=True, exist_ok=True)
 
-    def download_finished(self):
-        self.download_button.setEnabled(True)
-        self.load_button.setEnabled(True)
-        self.status_label.setText(
-            "Đã hoàn tất. Hãy kiểm tra thư mục lưu video."
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(folder))
         )
+
+    def selected_id(self):
+
+        row = self.table.currentRow()
+
+        if row < 0:
+            return None
+
+        item = self.table.item(row, 0)
+
+        if not item:
+            return None
+
+        try:
+            return int(item.text())
+        except ValueError:
+            return None
+
+    def pause_selected(self):
+
+        task_id = self.selected_id()
+
+        if task_id is None:
+            return
+
+        if self.manager.pause(task_id):
+            self.status_label.setText(
+                "Đã gửi yêu cầu tạm dừng."
+            )
+
+        self.refresh_table()
+
+    def resume_selected(self):
+
+        task_id = self.selected_id()
+
+        if task_id is None:
+            return
+
+        if self.manager.resume(task_id):
+            self.status_label.setText(
+                "Đã gửi yêu cầu tiếp tục."
+            )
+
+        self.refresh_table()
+
+    def cancel_selected(self):
+
+        task_id = self.selected_id()
+
+        if task_id is None:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Xác nhận",
+            "Bạn muốn hủy tác vụ này?"
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.manager.cancel(task_id)
+        self.refresh_table()
+
+    def refresh_table(self):
+
+        tasks = self.manager.database.list_tasks()
+
+        self.table.setRowCount(len(tasks))
+
+        for row, task in enumerate(tasks):
+
+            values = [
+                str(task["id"]),
+                task.get("url", ""),
+                task.get("status", ""),
+                f"{task.get('progress', 0)}%",
+                task.get("file_path", "")
+            ]
+
+            for column, value in enumerate(values):
+
+                item = QTableWidgetItem(value)
+
+                if column == 0:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                    )
+
+                self.table.setItem(row, column, item)
+
+    def export_excel(self):
+
+        tasks = self.manager.database.export_rows()
+
+        if not tasks:
+            QMessageBox.information(
+                self, "Thông báo",
+                "Chưa có lịch sử để xuất Excel."
+            )
+            return
+
+        default_path = str(
+            Path.home() / "Downloads" /
+            "TikTok_History.xlsx"
+        )
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Lưu file Excel",
+            default_path,
+            "Excel (*.xlsx)"
+        )
+
+        if not path:
+            return
+
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        try:
+            saved = self.exporter.export(
+                tasks,
+                path
+            )
+
+            QMessageBox.information(
+                self,
+                "Thành công",
+                f"Đã xuất Excel:\n{saved}"
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Lỗi xuất Excel", str(error)
+            )
+
+    def closeEvent(self, event):
+
+        answer = QMessageBox.question(
+            self,
+            "Thoát chương trình",
+            "Bạn có muốn thoát không? "
+            "Các tác vụ đang chạy sẽ bị yêu cầu hủy."
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+
+        self.timer.stop()
+
+        if (
+            self.account_worker
+            and self.account_worker.isRunning()
+        ):
+            self.account_worker.wait(3000)
+
+        self.manager.downloader.shutdown(wait=False)
+
+        event.accept()
 
 
 if __name__ == "__main__":
+
     app = QApplication(sys.argv)
-    window = TikTokDownloader()
+
+    window = MainWindow()
     window.show()
+
     sys.exit(app.exec())
