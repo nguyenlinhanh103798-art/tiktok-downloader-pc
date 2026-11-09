@@ -5,6 +5,7 @@ import re
 import subprocess
 from pathlib import Path
 
+import requests
 import yt_dlp
 import imageio_ffmpeg
 
@@ -28,10 +29,16 @@ def normalize_input(value):
     if re.fullmatch(r"[A-Za-z0-9._]+", value):
         return "https://www.tiktok.com/@" + value
 
-    if value.startswith("www.tiktok.com/") or value.startswith("vt.tiktok.com/"):
+    if value.startswith(("www.tiktok.com/", "vt.tiktok.com/")):
         return "https://" + value
 
     return value
+
+
+def safe_filename(name):
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:100] or "TikTok_video"
 
 
 class DownloadWorker(QThread):
@@ -46,10 +53,207 @@ class DownloadWorker(QThread):
         self.device_id = device_id
         self.downloaded = 0
         self.failed = 0
-        self.current_percent = 0
 
     def log(self, message):
         self.log_signal.emit(message)
+
+    def verify_video(self, file_path, ffmpeg_path):
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-v", "error",
+                    "-i", str(file_path),
+                    "-map", "0:v:0",
+                    "-frames:v", "1",
+                    "-f", "null",
+                    "-"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=40
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def download_tikwm(self, url, ffmpeg_path):
+        self.log("Đang thử tải bằng TikWM...")
+
+        api_url = "https://www.tikwm.com/api/"
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+            )
+        }
+
+        response = requests.post(
+            api_url,
+            data={"url": url, "hd": 1},
+            headers=headers,
+            timeout=(20, 60)
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        data = result.get("data") or {}
+
+        if result.get("code") not in (0, None) and result.get("msg") != "success":
+            raise Exception(
+                result.get("msg") or "TikWM không lấy được video."
+            )
+
+        video_url = (
+            data.get("hdplay")
+            or data.get("play")
+        )
+
+        if not video_url:
+            raise Exception("TikWM không trả về đường dẫn video.")
+
+        title = safe_filename(data.get("title") or "TikTok_video")
+        video_id = safe_filename(str(data.get("id") or "video"))
+
+        filename = f"{title}_{video_id}.mp4"
+        final_path = Path(self.folder) / filename
+        temp_path = Path(self.folder) / (filename + ".part")
+
+        self.log("TikWM đã tìm thấy video. Đang tải MP4...")
+
+        with requests.get(
+            video_url,
+            headers=headers,
+            stream=True,
+            timeout=(20, 120)
+        ) as video_response:
+
+            video_response.raise_for_status()
+
+            content_type = video_response.headers.get(
+                "Content-Type", ""
+            ).lower()
+
+            if "text/html" in content_type:
+                raise Exception("TikWM trả về trang lỗi thay vì video.")
+
+            total = int(
+                video_response.headers.get("Content-Length", 0)
+            )
+            received = 0
+
+            with open(temp_path, "wb") as file:
+                for chunk in video_response.iter_content(1024 * 256):
+                    if chunk:
+                        file.write(chunk)
+                        received += len(chunk)
+
+                        if total:
+                            percent = int(received * 100 / total)
+                            self.progress_signal.emit(
+                                max(0, min(percent, 100))
+                            )
+
+        if not temp_path.exists() or temp_path.stat().st_size < 10000:
+            raise Exception("File tải về quá nhỏ hoặc không hợp lệ.")
+
+        if not self.verify_video(temp_path, ffmpeg_path):
+            raise Exception("File TikWM trả về không có hình ảnh video.")
+
+        os.replace(temp_path, final_path)
+
+        self.progress_signal.emit(100)
+        self.log("TikWM tải và kiểm tra video thành công.")
+
+        return final_path
+
+    def download_ytdlp(self, url, ffmpeg_path):
+        self.log("Đang thử tải bằng yt-dlp...")
+
+        before = set(Path(self.folder).glob("*"))
+
+        options = {
+            "format": (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/"
+                "best[height>0]"
+            ),
+            "outtmpl": os.path.join(
+                self.folder,
+                "%(uploader)s_%(title).80B_%(id)s.%(ext)s"
+            ),
+            "noplaylist": False,
+            "ignoreerrors": True,
+            "quiet": True,
+            "no_warnings": False,
+            "windowsfilenames": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "extractor_retries": 5,
+            "socket_timeout": 45,
+            "merge_output_format": "mp4",
+            "ffmpeg_location": ffmpeg_path,
+            "progress_hooks": [self.progress_hook],
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.tiktok.com/"
+            }
+        }
+
+        if self.device_id:
+            options["extractor_args"] = {
+                "tiktok": {
+                    "device_id": [self.device_id]
+                }
+            }
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+
+        after = set(Path(self.folder).glob("*"))
+        new_files = after - before
+
+        valid = []
+
+        for path in new_files:
+            if not path.is_file():
+                continue
+
+            if path.suffix.lower() not in (
+                ".mp4", ".mkv", ".webm", ".mov", ".avi"
+            ):
+                continue
+
+            if path.stat().st_size < 10000:
+                continue
+
+            if self.verify_video(path, ffmpeg_path):
+                valid.append(path)
+
+        return valid
+
+    def progress_hook(self, data):
+        if data.get("status") == "downloading":
+            total = (
+                data.get("total_bytes")
+                or data.get("total_bytes_estimate")
+            )
+            downloaded = data.get("downloaded_bytes", 0)
+
+            if total:
+                percent = int(downloaded * 100 / total)
+                self.progress_signal.emit(
+                    max(0, min(percent, 100))
+                )
+
+        elif data.get("status") == "finished":
+            self.progress_signal.emit(100)
+            self.log("Đã tải dữ liệu, đang xử lý video...")
 
     def run(self):
         try:
@@ -62,7 +266,8 @@ class DownloadWorker(QThread):
         os.makedirs(self.folder, exist_ok=True)
 
         for index, url in enumerate(self.items, start=1):
-            self.current_percent = 0
+            self.progress_signal.emit(0)
+
             self.log("")
             self.log(f"ĐANG XỬ LÝ {index}/{len(self.items)}")
             self.log(url)
@@ -71,99 +276,44 @@ class DownloadWorker(QThread):
                 re.search(r"tiktok\.com/@[^/?]+/?$", url) is not None
             )
 
-            options = {
-                "format": (
-                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                    "bestvideo+bestaudio/"
-                    "best[height>0]"
-                ),
-                "outtmpl": os.path.join(
-                    self.folder,
-                    "%(uploader)s_%(title).80B_%(id)s.%(ext)s"
-                ),
-                "noplaylist": not is_profile,
-                "ignoreerrors": True,
-                "quiet": True,
-                "no_warnings": False,
-                "windowsfilenames": True,
-                "retries": 5,
-                "fragment_retries": 5,
-                "extractor_retries": 5,
-                "socket_timeout": 45,
-                "merge_output_format": "mp4",
-                "ffmpeg_location": ffmpeg_path,
-                "progress_hooks": [self.progress_hook],
-                "http_headers": {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/130.0.0.0 Safari/537.36"
-                    ),
-                    "Referer": "https://www.tiktok.com/"
-                }
-            }
-
-            if self.device_id:
-                options["extractor_args"] = {
-                    "tiktok": {
-                        "device_id": [self.device_id]
-                    }
-                }
-
             try:
-                before_files = set(Path(self.folder).glob("*"))
+                if is_profile:
+                    videos = self.download_ytdlp(url, ffmpeg_path)
 
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    result = ydl.download([url])
+                    if videos:
+                        self.downloaded += len(videos)
+                        self.log(
+                            f"THÀNH CÔNG: Đã tải {len(videos)} video."
+                        )
+                    else:
+                        self.failed += 1
+                        self.log("Không tìm thấy video tải được.")
 
-                after_files = set(Path(self.folder).glob("*"))
-                new_files = after_files - before_files
-
-                valid_videos = []
-                for file_path in new_files:
-                    if not file_path.is_file():
-                        continue
-
-                    if file_path.suffix.lower() not in (
-                        ".mp4", ".mkv", ".webm", ".mov", ".avi"
-                    ):
-                        continue
-
-                    if file_path.stat().st_size < 10000:
-                        continue
-
-                    # Kiểm tra file có hình ảnh video hay không
-                    check = subprocess.run(
-                        [
-                            ffmpeg_path,
-                            "-v", "error",
-                            "-i", str(file_path),
-                            "-map", "0:v:0",
-                            "-frames:v", "1",
-                            "-f", "null",
-                            "-"
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=30
-                    )
-
-                    if check.returncode == 0:
-                        valid_videos.append(file_path)
-
-                if valid_videos:
-                    self.downloaded += len(valid_videos)
-                    self.log(
-                        f"THÀNH CÔNG: Đã tải {len(valid_videos)} video."
-                    )
                 else:
-                    self.failed += 1
-                    self.log(
-                        "THẤT BẠI: Không tìm thấy file video có hình ảnh."
-                    )
-                    self.log(
-                        "TikTok có thể đã hạn chế video hoặc chỉ trả về âm thanh."
-                    )
+                    try:
+                        self.download_tikwm(url, ffmpeg_path)
+                        self.downloaded += 1
+
+                    except Exception as tikwm_error:
+                        self.log(
+                            "TikWM chưa tải được: " + str(tikwm_error)
+                        )
+                        self.log("Chuyển sang phương án dự phòng...")
+
+                        videos = self.download_ytdlp(
+                            url, ffmpeg_path
+                        )
+
+                        if videos:
+                            self.downloaded += len(videos)
+                            self.log(
+                                f"THÀNH CÔNG: Đã tải {len(videos)} video."
+                            )
+                        else:
+                            self.failed += 1
+                            self.log(
+                                "THẤT BẠI: Cả hai phương án đều không tải được."
+                            )
 
             except Exception as e:
                 self.failed += 1
@@ -178,19 +328,6 @@ class DownloadWorker(QThread):
         self.progress_signal.emit(100)
         self.finished_signal.emit()
 
-    def progress_hook(self, data):
-        if data.get("status") == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate")
-            downloaded = data.get("downloaded_bytes", 0)
-
-            if total:
-                percent = int(downloaded * 100 / total)
-                self.progress_signal.emit(max(0, min(percent, 100)))
-
-        elif data.get("status") == "finished":
-            self.progress_signal.emit(100)
-            self.log("Đã tải xong dữ liệu, đang xử lý video...")
-
 
 class TikTokDownloader(QMainWindow):
     def __init__(self):
@@ -199,7 +336,9 @@ class TikTokDownloader(QMainWindow):
         self.setWindowTitle("TikTok Downloader - Tải video hàng loạt")
         self.resize(850, 700)
 
-        self.download_folder = str(Path.home() / "Downloads" / "TikTok")
+        self.download_folder = str(
+            Path.home() / "Downloads" / "TikTok"
+        )
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -207,11 +346,13 @@ class TikTokDownloader(QMainWindow):
         layout = QVBoxLayout(central)
 
         title = QLabel("TIKTOK DOWNLOADER")
-        title.setStyleSheet("font-size: 23px; font-weight: bold;")
+        title.setStyleSheet(
+            "font-size: 23px; font-weight: bold;"
+        )
         layout.addWidget(title)
 
         layout.addWidget(QLabel(
-            "Nhập link video, link trang cá nhân hoặc @username. "
+            "Nhập link video hoặc tài khoản TikTok. "
             "Mỗi dòng một link:"
         ))
 
@@ -225,19 +366,14 @@ class TikTokDownloader(QMainWindow):
         layout.addWidget(self.url_input)
 
         layout.addWidget(QLabel(
-            "Device ID TikTok (không phải mật khẩu):"
+            "Device ID TikTok (không phải mật khẩu, tùy chọn):"
         ))
 
         self.device_id_input = QLineEdit()
         self.device_id_input.setPlaceholderText(
-            "Dán Device ID 19 chữ số vào đây"
+            "Dán Device ID 19 chữ số nếu muốn dùng dự phòng yt-dlp"
         )
         layout.addWidget(self.device_id_input)
-
-        layout.addWidget(QLabel(
-            "Device ID chỉ được dùng khi chạy ứng dụng trên máy này, "
-            "không ghi vào mã nguồn GitHub."
-        ))
 
         folder_layout = QHBoxLayout()
 
@@ -285,7 +421,9 @@ class TikTokDownloader(QMainWindow):
 
         if folder:
             self.download_folder = folder
-            self.folder_label.setText("Thư mục lưu: " + folder)
+            self.folder_label.setText(
+                "Thư mục lưu: " + folder
+            )
 
     def open_folder(self):
         os.makedirs(self.download_folder, exist_ok=True)
@@ -296,7 +434,9 @@ class TikTokDownloader(QMainWindow):
 
         if not raw_text:
             QMessageBox.warning(
-                self, "Thiếu link", "Bạn hãy nhập link TikTok trước."
+                self,
+                "Thiếu link",
+                "Bạn hãy nhập link TikTok trước."
             )
             return
 
@@ -306,12 +446,12 @@ class TikTokDownloader(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Device ID không hợp lệ",
-                "Device ID phải gồm đúng 19 chữ số. "
-                "Bạn hãy kiểm tra và nhập lại."
+                "Device ID phải gồm đúng 19 chữ số."
             )
             return
 
         items = []
+
         for line in raw_text.splitlines():
             value = normalize_input(line)
             if value:
@@ -319,7 +459,9 @@ class TikTokDownloader(QMainWindow):
 
         if not items:
             QMessageBox.warning(
-                self, "Thiếu link", "Không tìm thấy link hợp lệ."
+                self,
+                "Thiếu link",
+                "Không tìm thấy link hợp lệ."
             )
             return
 
@@ -334,8 +476,12 @@ class TikTokDownloader(QMainWindow):
         )
 
         self.worker.log_signal.connect(self.add_log)
-        self.worker.progress_signal.connect(self.progress.setValue)
-        self.worker.finished_signal.connect(self.download_finished)
+        self.worker.progress_signal.connect(
+            self.progress.setValue
+        )
+        self.worker.finished_signal.connect(
+            self.download_finished
+        )
 
         self.worker.start()
 
@@ -344,11 +490,12 @@ class TikTokDownloader(QMainWindow):
 
     def download_finished(self):
         self.download_button.setEnabled(True)
+
         QMessageBox.information(
             self,
             "Hoàn tất",
             "Đã kết thúc quá trình tải. "
-            "Bạn hãy kiểm tra thư mục video."
+            "Hãy kiểm tra thư mục video."
         )
 
 
