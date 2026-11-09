@@ -23,11 +23,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller imageio-ffmpeg
+
+      - name: Kiem tra FFmpeg
+        run: |
+          python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
 
       - name: Dong goi EXE
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name TikTokDownloader main.py
+          pyinstaller --noconfirm --clean --onefile --windowed --collect-all imageio_ffmpeg --name TikTokDownloader main.py
 
       - name: Luu file EXE
         uses: actions/upload-artifact@v4
